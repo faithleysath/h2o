@@ -1,0 +1,52 @@
+name: Sync Upstream Chain
+
+on:
+  schedule:
+    # 每周一凌晨 2 点运行
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+jobs:
+  sync-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 我们需要完整历史来进行 rebase
+          fetch-depth: 0
+          # 必须使用 PAT，否则最后推送到 prod 时无法触发 Build Workflow
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Sync Master from Upstream
+        run: |
+          # 1. 设置上游
+          git remote add upstream https://github.com/h2o/h2o.git
+          git fetch upstream master
+
+          # 2. 切换到本地 master 并强制重置为上游状态
+          git checkout master
+          git reset --hard upstream/master
+
+          # 3. 推送更新到你自己的仓库 master
+          # 这步不需要触发 CI，所以如果是 PAT，GitHub 可能会尝试触发，但 master 分支下没有 workflow 监听 push 事件也没关系
+          git push origin master --force
+
+      - name: Rebase Prod onto Master
+        run: |
+          # 1. 切换到 prod 分支
+          git checkout prod
+          
+          # 2. 将 prod 变基到最新的 master 上
+          # 这会将你的 Dockerfile 提交 "浮" 到最新的提交之上
+          echo "Rebasing prod onto master..."
+          git rebase master
+
+          # 3. 强制推送 prod
+          # 由于使用了 PAT，这一步操作会触发 build.yml
+          git push origin prod --force

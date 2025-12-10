@@ -1,0 +1,160 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - prod
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # 将仓库名转为小写，GHCR 对大小写敏感
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # =================================================================
+  # 任务 1: 矩阵构建 (并行编译 AMD64 和 ARM64)
+  # =================================================================
+  build-arch:
+    name: Build ${{ matrix.arch }}
+    # 根据架构动态选择 Runner (GitHub 原生 ARM runner 目前在 public repo 可用)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            # 使用 GitHub 原生 ARM runner (ubuntu-24.04-arm)
+            # 如果你的账号还没开通，可以使用 ubuntu-latest + QEMU，但编译速度会慢很多
+            runner: ubuntu-24.04-arm
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 设置 Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 登录 GHCR
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 生成临时 Tag 用于区分架构，例如: ghcr.io/user/repo:prod-amd64
+      - name: Calculate Tags
+        id: meta
+        run: |
+          echo "tag_name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-${{ matrix.arch }}" >> $GITHUB_OUTPUT
+
+      # 构建并推送 (带有缓存)
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ steps.meta.outputs.tag_name }}
+          # 缓存配置：利用 GitHub Actions 缓存层
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # 传递构建参数（可选）
+          build-args: |
+            H2O_VERSION=master
+
+      # 从镜像中提取二进制文件
+      # 技巧：创建一个临时容器，cp 出来，然后删除容器
+      - name: Extract Binary
+        run: |
+          docker create --name extract "${{ steps.meta.outputs.tag_name }}"
+          docker cp extract:/usr/local/bin/h2o ./h2o-${{ matrix.arch }}
+          docker rm extract
+
+      # 上传二进制文件作为 Artifact (供后续 Release 任务使用)
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: ./h2o-${{ matrix.arch }}
+          retention-days: 1
+
+  # =================================================================
+  # 任务 2: 合并 Docker 镜像 (Manifest List)
+  # =================================================================
+  merge-manifest:
+    needs: build-arch
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and Push Manifest
+        run: |
+          # 定义源镜像和目标镜像
+          AMD_IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-amd64"
+          ARM_IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-arm64"
+          TARGET_IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          
+          # 创建 Manifest List (将两个架构合并为一个 latest 标签)
+          docker buildx imagetools create -t "$TARGET_IMG" "$AMD_IMG" "$ARM_IMG"
+          
+          echo "✅ Successfully pushed multi-arch image: $TARGET_IMG"
+
+  # =================================================================
+  # 任务 3: 发布 Release
+  # =================================================================
+  release:
+    needs: build-arch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 需要写权限来创建 Release
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: Generate Date Version
+        id: date
+        run: echo "date=$(date +'%Y.%m.%d')" >> $GITHUB_OUTPUT
+
+      - name: Create or Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.date.outputs.date }}
+          name: Release ${{ steps.date.outputs.date }}
+          body: |
+            Automated build from prod branch.
+            Contains statically linked h2o binaries and Docker images.
+            
+            Docker Pull:
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ```
+          files: |
+            artifacts/h2o-amd64
+            artifacts/h2o-arm64
+          # 如果标签已存在，允许更新
+          make_latest: true
+          overwrite: true
